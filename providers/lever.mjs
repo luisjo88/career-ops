@@ -30,6 +30,7 @@ export default {
       url: j.hostedUrl || '',
       company: entry.name,
       location: j.categories?.location || '',
+      postedAt: j.createdAt || 0,  // Lever createdAt is already epoch ms
     }));
   },
 };

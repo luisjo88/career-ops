@@ -18,6 +18,7 @@
  * @property {string} company  May be empty when the source can't expose it
  *                             at the list-page level; populated downstream.
  * @property {string} location May be empty.
+ * @property {number} [postedAt] Epoch ms from provider date field. 0 = unknown. Used by scan.mjs for max_age_days filtering.
  */
 
 /**

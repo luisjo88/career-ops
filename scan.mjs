@@ -29,8 +29,10 @@ import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, rea
 import { pathToFileURL, fileURLToPath } from 'url';
 import path from 'path';
 import yaml from 'js-yaml';
+import { chromium } from 'playwright';
 
 import { makeHttpCtx } from './providers/_http.mjs';
+import { classifyLiveness } from './liveness-core.mjs';
 
 const parseYaml = yaml.load;
 
@@ -197,17 +199,58 @@ function appendToPipeline(offers) {
   writeFileSync(PIPELINE_PATH, text, 'utf-8');
 }
 
-function appendToScanHistory(offers, date) {
+function appendToScanHistory(offers, date, status = 'added') {
   // Ensure file + header exist
   if (!existsSync(SCAN_HISTORY_PATH)) {
     writeFileSync(SCAN_HISTORY_PATH, 'url\tfirst_seen\tportal\ttitle\tcompany\tstatus\n', 'utf-8');
   }
 
   const lines = offers.map(o =>
-    `${o.url}\t${date}\t${o.source}\t${o.title}\t${o.company}\tadded`
+    `${o.url}\t${date}\t${o.source}\t${o.title}\t${o.company}\t${status}`
   ).join('\n') + '\n';
 
   appendFileSync(SCAN_HISTORY_PATH, lines, 'utf-8');
+}
+
+// ── Date-age filter ─────────────────────────────────────────────────
+
+function isJobRecent(job, maxAgeDays) {
+  if (!job.postedAt || maxAgeDays <= 0) return true;
+  return (Date.now() - job.postedAt) / 86400000 <= maxAgeDays;
+}
+
+// ── Liveness check (Playwright) ─────────────────────────────────────
+
+async function livenessCheck(urls, concurrency = 3, timeoutMs = 10000) {
+  if (urls.length === 0) return new Map();
+  const results = new Map();
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const pages = await Promise.all(
+      Array.from({ length: Math.min(concurrency, urls.length) }, () => browser.newPage())
+    );
+    let i = 0;
+    async function worker(page) {
+      while (i < urls.length) {
+        const url = urls[i++];
+        let res;
+        try {
+          const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+          const status = response?.status() ?? 0;
+          const finalUrl = page.url();
+          const bodyText = await page.evaluate(() => document.body?.innerText ?? '');
+          res = classifyLiveness({ status, finalUrl, bodyText, applyControls: [] });
+        } catch (err) {
+          res = { result: 'uncertain', reason: `check failed: ${err.message.split('\n')[0]}` };
+        }
+        results.set(url, res);
+      }
+    }
+    await Promise.all(pages.map(p => worker(p)));
+  } finally {
+    await browser.close();
+  }
+  return results;
 }
 
 // ── Parallel fetch with concurrency limit ───────────────────────────
@@ -252,6 +295,7 @@ async function main() {
   const config = parseYaml(readFileSync(PORTALS_PATH, 'utf-8'));
   const companies = config.tracked_companies || [];
   const titleFilter = buildTitleFilter(config.title_filter);
+  const maxAgeDays = Number(config.max_age_days ?? 14);
 
   // 3. Resolve a provider for each enabled company
   const targets = [];
@@ -323,13 +367,33 @@ async function main() {
 
   await parallelFetch(tasks, CONCURRENCY);
 
-  // 6. Write results
-  if (!dryRun && newOffers.length > 0) {
-    appendToPipeline(newOffers);
-    appendToScanHistory(newOffers, date);
+  // 6. Date-age filter — stale jobs are NOT recorded so reposts are caught next scan
+  const recentOffers = newOffers.filter(o => isJobRecent(o, maxAgeDays));
+  const droppedStale = newOffers.length - recentOffers.length;
+
+  // 7. Liveness check — dead jobs ARE recorded with status 'dead' to skip re-checking
+  let liveOffers = recentOffers;
+  let deadOffers = [];
+  let droppedDead = 0;
+  if (recentOffers.length > 0) {
+    const livenessResults = await livenessCheck(recentOffers.map(o => o.url));
+    deadOffers = recentOffers.filter(o => livenessResults.get(o.url)?.result === 'expired');
+    liveOffers = recentOffers.filter(o => livenessResults.get(o.url)?.result !== 'expired');
+    droppedDead = deadOffers.length;
   }
 
-  // 7. Print summary
+  // 8. Write results
+  if (!dryRun) {
+    if (liveOffers.length > 0) {
+      appendToPipeline(liveOffers);
+      appendToScanHistory(liveOffers, date);
+    }
+    if (deadOffers.length > 0) {
+      appendToScanHistory(deadOffers, date, 'dead');
+    }
+  }
+
+  // 9. Print summary
   console.log(`\n${'━'.repeat(45)}`);
   console.log(`Portal Scan — ${date}`);
   console.log(`${'━'.repeat(45)}`);
@@ -337,7 +401,9 @@ async function main() {
   console.log(`Total jobs found:      ${totalFound}`);
   console.log(`Filtered by title:     ${totalFiltered} removed`);
   console.log(`Duplicates:            ${totalDupes} skipped`);
-  console.log(`New offers added:      ${newOffers.length}`);
+  console.log(`Dropped stale (>${maxAgeDays}d): ${droppedStale}`);
+  console.log(`Dropped dead:          ${droppedDead}`);
+  console.log(`New offers added:      ${liveOffers.length}`);
 
   if (errors.length > 0) {
     console.log(`\nErrors (${errors.length}):`);
@@ -346,9 +412,9 @@ async function main() {
     }
   }
 
-  if (newOffers.length > 0) {
+  if (liveOffers.length > 0) {
     console.log('\nNew offers:');
-    for (const o of newOffers) {
+    for (const o of liveOffers) {
       console.log(`  + ${o.company} | ${o.title} | ${o.location || 'N/A'}`);
     }
     if (dryRun) {

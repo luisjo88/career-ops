@@ -30,6 +30,7 @@ export default {
       url: j.jobUrl || '',
       company: entry.name,
       location: j.location || '',
+      postedAt: Date.parse(j.publishedAt) || 0,
     }));
   },
 };

@@ -57,6 +57,7 @@ export default {
       url: j.absolute_url,
       company: entry.name,
       location: j.location?.name || '',
+      postedAt: Date.parse(j.updated_at) || 0,
     }));
   },
 };
